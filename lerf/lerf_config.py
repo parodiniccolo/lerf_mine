@@ -19,7 +19,7 @@ Swap out the network config to use OpenCLIP or CLIP here.
 """
 from lerf.encoders.clip_encoder import CLIPNetworkConfig
 from lerf.encoders.openclip_encoder import OpenCLIPNetworkConfig
-
+# test
 lerf_method = MethodSpecification(
     config=TrainerConfig(
         method_name="lerf",
