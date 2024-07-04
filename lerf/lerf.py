@@ -5,6 +5,7 @@ from typing import Dict, List, Tuple, Type
 import numpy as np
 import open_clip
 import torch
+import open3d as o3d
 from nerfstudio.cameras.rays import RayBundle, RaySamples
 from nerfstudio.data.scene_box import SceneBox
 from nerfstudio.field_components.field_heads import FieldHeadNames
@@ -12,8 +13,8 @@ from nerfstudio.field_components.spatial_distortions import SceneContraction
 from nerfstudio.model_components.ray_samplers import PDFSampler
 from nerfstudio.model_components.renderers import DepthRenderer
 from nerfstudio.models.nerfacto import NerfactoModel, NerfactoModelConfig
-from nerfstudio.utils.colormaps import ColormapOptions, apply_colormap
-from nerfstudio.viewer.viewer_elements import *
+from nerfstudio.utils.colormaps import apply_colormap
+from nerfstudio.viewer.server.viewer_elements import *
 from torch.nn import Parameter
 
 from lerf.encoders.image_encoder import BaseImageEncoder
@@ -52,6 +53,53 @@ class LERFModel(NerfactoModel):
             clip_n_dims=self.image_encoder.embedding_dim,
         )
 
+        # populate some viewer logic
+        # TODO use the values from this code to select the scale
+        # def scale_cb(element):
+        #     self.config.n_scales = element.value
+
+        # self.n_scale_slider = ViewerSlider("N Scales", 15, 5, 30, 1, cb_hook=scale_cb)
+
+        # def max_cb(element):
+        #     self.config.max_scale = element.value
+
+        # self.max_scale_slider = ViewerSlider("Max Scale", 1.5, 0, 5, 0.05, cb_hook=max_cb)
+
+        # def hardcode_scale_cb(element):
+        #     self.hardcoded_scale = element.value
+
+        # self.hardcoded_scale_slider = ViewerSlider(
+        #     "Hardcoded Scale", 1.0, 0, 5, 0.05, cb_hook=hardcode_scale_cb, disabled=True
+        # )
+
+        # def single_scale_cb(element):
+        #     self.n_scale_slider.set_disabled(element.value)
+        #     self.max_scale_slider.set_disabled(element.value)
+        #     self.hardcoded_scale_slider.set_disabled(not element.value)
+
+        # self.single_scale_box = ViewerCheckbox("Single Scale", False, cb_hook=single_scale_cb)
+    
+    def get_clip_embedding(self, ray_samples, weights, hashgrid_field, scales_shape):
+        scales_list = torch.linspace(0.0, self.config.max_scale, self.config.n_scales)
+        
+        clip_embedding_list = []
+        for _, scale in enumerate(scales_list):
+            scale = scale.item()
+            with torch.no_grad():
+                clip_output = self.lerf_field.get_output_from_hashgrid(
+                    ray_samples,
+                    hashgrid_field,
+                    torch.full(scales_shape, scale, device=weights.device, dtype=hashgrid_field.dtype),
+                )
+            clip_output = self.renderer_clip(embeds=clip_output, weights=weights.detach())
+            clip_embedding_list.append(clip_output)
+            # 4096 512
+        
+        clip_embedding = torch.stack(clip_embedding_list, dim=1)
+        print("CLIP Embeddings: ", clip_embedding.shape)
+        
+        return clip_embedding
+
     def get_max_across(self, ray_samples, weights, hashgrid_field, scales_shape, preset_scales=None):
         # TODO smoothen this out
         if preset_scales is not None:
@@ -64,7 +112,7 @@ class LERFModel(NerfactoModel):
         n_phrases = len(self.image_encoder.positives)
         n_phrases_maxs = [None for _ in range(n_phrases)]
         n_phrases_sims = [None for _ in range(n_phrases)]
-        for i, scale in enumerate(scales_list):
+        for _, scale in enumerate(scales_list):
             scale = scale.item()
             with torch.no_grad():
                 clip_output = self.lerf_field.get_output_from_hashgrid(
@@ -73,24 +121,60 @@ class LERFModel(NerfactoModel):
                     torch.full(scales_shape, scale, device=weights.device, dtype=hashgrid_field.dtype),
                 )
             clip_output = self.renderer_clip(embeds=clip_output, weights=weights.detach())
-
-            for j in range(n_phrases):
-                if preset_scales is None or j == i:
-                    probs = self.image_encoder.get_relevancy(clip_output, j)
-                    pos_prob = probs[..., 0:1]
-                    if n_phrases_maxs[j] is None or pos_prob.max() > n_phrases_sims[j].max():
-                        n_phrases_maxs[j] = scale
-                        n_phrases_sims[j] = pos_prob
+            # 4096, 512
+            # 4096, 5, 512
+            # torch.unsqueeze(clip_output, 1)
+            for i in range(n_phrases):
+                probs = self.image_encoder.get_relevancy(clip_output, i)
+                pos_prob = probs[..., 0:1]
+                if n_phrases_maxs[i] is None or pos_prob.max() > n_phrases_sims[i].max():
+                    n_phrases_maxs[i] = scale
+                    n_phrases_sims[i] = pos_prob
         return torch.stack(n_phrases_sims), torch.Tensor(n_phrases_maxs)
+
+    def get_outputs_mesh_vertices(self, batch_size, ply_path: str):
+        outputs_mesh = {}
+        mesh = o3d.io.read_triangle_mesh(ply_path)
+        vertices = mesh.vertices
+        vertices = np.asarray(vertices)
+        vertices = torch.from_numpy(vertices)
+        reshaped_tensor = torch.unsqueeze(vertices, 0)
+        start = 0
+        end = 2
+        num_points = 10
+
+        linspace_array = np.linspace(start, end, num_points)
+        for index, step in enumerate(linspace_array):
+            step = torch.tensor(step)
+            # Calculate the total number of batches
+            total_batches = (reshaped_tensor.shape[1] + batch_size - 1) // batch_size
+            # clip_scales = torch.ones_like(step, device=self.device)
+            # Iterate over the tensor in smaller batches
+            stacked_tensor = torch.empty(1, 0, 512)
+            for i in range(total_batches):
+                start_idx = i * batch_size
+                end_idx = min((i + 1) * batch_size, reshaped_tensor.shape[1])
+                batch = reshaped_tensor[:, start_idx:end_idx, :]
+                batch.to(self.device)
+                clip_scales = torch.full((1, batch.shape[1], 1), step, device=self.device)
+                outputs = self.lerf_field.get_outputs_mesh_vertices(batch.shape[1],
+                                                                    batch,
+                                                                    clip_scales)
+                clip_embedding = outputs[LERFFieldHeadNames.CLIP].detach().cpu()
+                stacked_tensor = torch.cat((stacked_tensor, clip_embedding), dim=1)
+
+                print(stacked_tensor.shape)
+            outputs_mesh[index] = stacked_tensor
+
+        return outputs_mesh
 
     def get_outputs(self, ray_bundle: RayBundle):
         if self.training:
             self.camera_optimizer.apply_to_raybundle(ray_bundle)
         ray_samples, weights_list, ray_samples_list = self.proposal_sampler(ray_bundle, density_fns=self.density_fns)
         ray_samples_list.append(ray_samples)
-
         nerfacto_field_outputs, outputs, weights = self._get_outputs_nerfacto(ray_samples)
-        lerf_weights, best_ids = torch.topk(weights, self.config.num_lerf_samples, dim=-2, sorted=False)
+        lerf_weights, best_ids = torch.topk(weights, self.config.num_lerf_samples, dim=-2, sorted=False)        
 
         def gather_fn(tens):
             return torch.gather(tens, -2, best_ids.expand(*best_ids.shape[:-1], tens.shape[-1]))
@@ -120,25 +204,34 @@ class LERFModel(NerfactoModel):
             outputs[f"prop_depth_{i}"] = self.renderer_depth(weights=weights_list[i], ray_samples=ray_samples_list[i])
 
         lerf_field_outputs = self.lerf_field.get_outputs(lerf_samples, clip_scales)
-        outputs["clip"] = self.renderer_clip(
+        # 4096 24 3
+        # 4096 1
+        outputs["clip_1"] = self.renderer_clip(
             embeds=lerf_field_outputs[LERFFieldHeadNames.CLIP], weights=lerf_weights.detach()
         )
-        outputs["dino"] = self.renderer_mean(
-            embeds=lerf_field_outputs[LERFFieldHeadNames.DINO], weights=lerf_weights.detach()
-        )
+
+
+        if self.training:
+            # lerf_field_outputs = self.lerf_field.get_outputs(lerf_samples, clip_scales)
+            outputs["clip"] = self.renderer_clip(
+                embeds=lerf_field_outputs[LERFFieldHeadNames.CLIP], weights=lerf_weights.detach()
+            )
+            outputs["dino"] = self.renderer_mean(
+                embeds=lerf_field_outputs[LERFFieldHeadNames.DINO], weights=lerf_weights.detach()
+            )
 
         if not self.training:
             with torch.no_grad():
-                max_across, best_scales = self.get_max_across(
+                clip_embedding = self.get_clip_embedding(
                     lerf_samples,
                     lerf_weights,
                     lerf_field_outputs[LERFFieldHeadNames.HASHGRID],
-                    clip_scales.shape,
-                    preset_scales=override_scales,
+                    clip_scales.shape
+                    # preset_scales=override_scales,
                 )
-                outputs["raw_relevancy"] = max_across  # N x B x 1
-                outputs["best_scales"] = best_scales.to(self.device)  # N
-
+                # outputs["raw_relevancy"] = max_across  # N x B x 1
+                # outputs["best_scales"] = best_scales.to(self.device)  # N
+            return outputs, clip_embedding
         return outputs
 
     @torch.no_grad()
@@ -194,7 +287,7 @@ class LERFModel(NerfactoModel):
             outputs[output_name] = torch.cat(outputs_list).view(image_height, image_width, -1)  # type: ignore
         for i in range(len(self.image_encoder.positives)):
             p_i = torch.clip(outputs[f"relevancy_{i}"] - 0.5, 0, 1)
-            outputs[f"composited_{i}"] = apply_colormap(p_i / (p_i.max() + 1e-6), ColormapOptions("turbo"))
+            outputs[f"composited_{i}"] = apply_colormap(p_i / (p_i.max() + 1e-6), "turbo")
             mask = (outputs["relevancy_0"] < 0.5).squeeze()
             outputs[f"composited_{i}"][mask, :] = outputs["rgb"][mask, :]
         return outputs
