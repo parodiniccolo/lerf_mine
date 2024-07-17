@@ -176,10 +176,11 @@ class LERFModel(NerfactoModel):
 
         lerf_field_outputs = self.lerf_field.get_outputs(lerf_samples, clip_scales)
   
+        """
         outputs["clip_1"] = self.renderer_clip(
             embeds=lerf_field_outputs[LERFFieldHeadNames.CLIP], weights=lerf_weights.detach()
         )
-
+        """
 
         if self.training:
             # lerf_field_outputs = self.lerf_field.get_outputs(lerf_samples, clip_scales)

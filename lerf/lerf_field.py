@@ -120,7 +120,7 @@ class LERFField(Field):
 
         return outputs
 
-    def get_outputs(self, ray_samples: RaySamples, clip_scales) -> Dict[LERFFieldHeadNames, TensorType]:
+    def get_outputs(self, ray_samples: RaySamples, clip_scales):
         # random scales, one scale
         outputs = {}
 
